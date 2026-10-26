@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""Stream an OptiTrack rigid body to a Crazyflie without the NatNet SDK client.
+
+The NatNet SDK client dies on the first frame when the version handshake has
+not finished, and its unicast keepalive then raises "Host is down" because
+this Mac cannot get a reply from the Motive command port. This script listens
+on the multicast group itself.
+
+Run calibrate_axes.py once. Slide the nose toward the wall the drone should
+fly at. That slide is Crazyflie +X. Motive can restart and rebuild the rigid
+body after that. At the start of every flight, face the nose at the same wall
+and hold still. This script reads that pose and keeps the nose on the wall.
+
+Motive stays on multicast. Broadcast Frame Data on, data port 1511,
+group 239.255.42.99.
+
+    python3 mocap_extpos_lab.py 10.10.10.100 --client 10.10.10.2 --body-id 4 --address 0xE7E7E7E7E7 --hover
+"""
+
+import inspect
+import math
+import socket
+import struct
+import threading
+import time
+
+import cflib.crtp
+from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+
+import mocap_extpos as ext
+
+MULTICAST_GROUP = "239.255.42.99"
+DATA_PORT = 1511
+NAT_FRAMEOFDATA = 7
+# NatNet 3+ labeled marker: id, xyz, size, param, residual.
+LABELED_MARKER_BYTES = 26
+
+
+def _accepts_markers(callback):
+    try:
+        parameters = list(inspect.signature(callback).parameters.values())
+    except (TypeError, ValueError):
+        return False
+    if any(item.kind == inspect.Parameter.VAR_POSITIONAL for item in parameters):
+        return True
+    positional = [
+        item
+        for item in parameters
+        if item.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    return len(positional) >= 4
+
+
+class MotiveListener:
+    """Receive Motive frames and pass each rigid body to a callback."""
+
+    def __init__(self, client_ip, on_rigid_body):
+        self.client_ip = client_ip
+        self.on_rigid_body = on_rigid_body
+        self._stop = threading.Event()
+        self._sock = None
+        self._thread = None
+        self._use_sizes = None
+        self._announced = False
+        self.packet_count = 0
+        self.datagram_count = 0
+        self.last_addr = None
+        self.first_id = None
+        self.first_len = 0
+        self.first_hex = ""
+        self.seen_ids = []
+        self._pass_markers = _accepts_markers(on_rigid_body)
+
+    def start(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("", DATA_PORT))
+            membership = struct.pack(
+                "4s4s",
+                socket.inet_aton(MULTICAST_GROUP),
+                socket.inet_aton(self.client_ip),
+            )
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+        except OSError as exc:
+            sock.close()
+            raise SystemExit(
+                f"Could not listen on UDP {DATA_PORT} ({exc}). "
+                "Close any other NatNet client first."
+            ) from exc
+        sock.settimeout(0.5)
+        self._sock = sock
+        self._thread = threading.Thread(target=self._receive, name="motive-listen", daemon=True)
+        self._thread.start()
+
+    def shutdown(self):
+        self._stop.set()
+        if self._sock is not None:
+            self._sock.close()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _receive(self):
+        while not self._stop.is_set():
+            try:
+                packet, addr = self._sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            self.datagram_count += 1
+            self.last_addr = addr[0]
+            if self.first_id is None and len(packet) >= 2:
+                self.first_id = int.from_bytes(packet[0:2], byteorder="little", signed=True)
+                self.first_len = len(packet)
+                self.first_hex = packet[:32].hex()
+            decoded = decode_frame(packet, self._use_sizes)
+            if decoded is None:
+                continue
+            layout, bodies, markers = decoded
+            if self._use_sizes is None:
+                self._use_sizes = layout
+            if not self._announced:
+                self._announced = True
+                ids = ", ".join(str(body_id) for body_id, _pos, _rot in bodies) or "none"
+                size_txt = "4.1+ size fields" if layout else "NatNet 3 / 4.0"
+                print(
+                    f"Motive stream from {addr[0]} ({size_txt}). "
+                    f"Rigid bodies: {ids}. Labeled markers: {len(markers)}"
+                )
+            self.packet_count += 1
+            for body_id, pos, rot in bodies:
+                if body_id not in self.seen_ids:
+                    self.seen_ids.append(body_id)
+                if self._pass_markers:
+                    self.on_rigid_body(body_id, pos, rot, markers)
+                else:
+                    self.on_rigid_body(body_id, pos, rot)
+
+
+def decode_frame(packet, locked_layout):
+    """Return (use_size_fields, bodies, markers) or None if this is not a frame."""
+    if len(packet) < 8:
+        return None
+    message_id = int.from_bytes(packet[0:2], byteorder="little", signed=True)
+    if message_id != NAT_FRAMEOFDATA:
+        return None
+    payload = packet[4:]
+    layouts = (locked_layout,) if locked_layout is not None else (True, False)
+    for use_sizes in layouts:
+        try:
+            bodies, markers = _walk_frame(payload, use_sizes)
+        except (ValueError, struct.error, IndexError):
+            continue
+        if _bodies_look_real(bodies):
+            return use_sizes, bodies, markers
+    return None
+
+
+def _walk_frame(data, use_sizes):
+    offset = 0
+    _frame, offset = _i32(data, offset)
+    offset = _skip_marker_sets(data, offset, use_sizes)
+    offset = _skip_other_markers(data, offset, use_sizes)
+    bodies, offset = _read_rigid_bodies(data, offset, use_sizes)
+    try:
+        markers = _read_labeled_markers(data, offset, use_sizes)
+    except (ValueError, struct.error, IndexError):
+        markers = []
+    return bodies, markers
+
+
+def _skip_marker_sets(data, offset, use_sizes):
+    marker_sets, offset = _i32(data, offset)
+    offset = _skip_size(data, offset, use_sizes)
+    if not 0 <= marker_sets <= 1000:
+        raise ValueError("marker set count")
+    for _ in range(marker_sets):
+        end = data.index(0, offset)
+        offset = end + 1
+        count, offset = _i32(data, offset)
+        if not 0 <= count <= 10000:
+            raise ValueError("marker count")
+        offset = _skip(data, offset, 12 * count)
+    return offset
+
+
+def _skip_other_markers(data, offset, use_sizes):
+    others, offset = _i32(data, offset)
+    offset = _skip_size(data, offset, use_sizes)
+    if not 0 <= others <= 100000:
+        raise ValueError("other marker count")
+    return _skip(data, offset, 12 * others)
+
+
+def _read_rigid_bodies(data, offset, use_sizes):
+    count, offset = _i32(data, offset)
+    offset = _skip_size(data, offset, use_sizes)
+    if not 0 <= count <= 1000:
+        raise ValueError("rigid body count")
+    bodies = []
+    for _ in range(count):
+        body_id, offset = _i32(data, offset)
+        pos = struct.unpack_from("<fff", data, offset)
+        offset += 12
+        rot = struct.unpack_from("<ffff", data, offset)
+        offset += 16
+        offset = _skip(data, offset, 6)
+        bodies.append((body_id, pos, rot))
+    return bodies, offset
+
+
+def _skip_sized_block(data, offset, use_sizes):
+    count, offset = _i32(data, offset)
+    if use_sizes:
+        size, offset = _i32(data, offset)
+        if size < 0:
+            raise ValueError("section size")
+        return _skip(data, offset, size)
+    if count != 0:
+        raise ValueError("non-empty section without a size")
+    return offset
+
+
+def _read_labeled_markers(data, offset, use_sizes):
+    offset = _skip_sized_block(data, offset, use_sizes)
+    if use_sizes:
+        offset = _skip_sized_block(data, offset, use_sizes)
+    count, offset = _i32(data, offset)
+    offset = _skip_size(data, offset, use_sizes)
+    if not 0 <= count <= 10000:
+        raise ValueError("labeled marker count")
+    markers = []
+    for _ in range(count):
+        if offset + LABELED_MARKER_BYTES > len(data):
+            raise ValueError("short labeled marker")
+        full_id, offset = _i32(data, offset)
+        pos = struct.unpack_from("<fff", data, offset)
+        offset += 12
+        offset = _skip(data, offset, 4)
+        param, = struct.unpack_from("<h", data, offset)
+        offset += 2
+        offset = _skip(data, offset, 4)
+        model_id = (full_id >> 16) & 0xFFFF
+        marker_id = full_id & 0xFFFF
+        markers.append((full_id, model_id, marker_id, pos, (param & 0x01) != 0))
+    if not _markers_look_real(markers):
+        raise ValueError("labeled markers")
+    return markers
+
+
+def _bodies_look_real(bodies):
+    if not bodies:
+        return False
+    for body_id, pos, rot in bodies:
+        if not 0 <= body_id < 100000:
+            return False
+        if any(not math.isfinite(value) or abs(value) > 100.0 for value in pos):
+            return False
+        norm = sum(value * value for value in rot)
+        if not 0.5 <= norm <= 1.5:
+            return False
+    return True
+
+
+def _markers_look_real(markers):
+    for _full_id, model_id, marker_id, pos, _occluded in markers:
+        if model_id < 0 or marker_id < 0:
+            return False
+        if any(not math.isfinite(value) or abs(value) > 100.0 for value in pos):
+            return False
+    return True
+
+
+def _i32(data, offset):
+    if offset + 4 > len(data):
+        raise ValueError("short packet")
+    return int.from_bytes(data[offset:offset + 4], byteorder="little", signed=True), offset + 4
+
+
+def _skip_size(data, offset, use_sizes):
+    if not use_sizes:
+        return offset
+    _size, offset = _i32(data, offset)
+    return offset
+
+
+def _skip(data, offset, nbytes):
+    end = offset + nbytes
+    if end > len(data):
+        raise ValueError("short packet")
+    return end
+
+
+WALL_HOLD_S = 0.6
+WALL_MIN_SAMPLES = 5
+# Resultant of 0.99 is about 8 deg of scatter while the drone is supposed to be still.
+WALL_STILL_RESULTANT = 0.99
+
+
+def lock_wall_heading(poses, matrix):
+    """Take the nose, aimed at the calibration wall, as forward for this flight.
+
+    The axis matrix already says which Motive direction is Crazyflie +X. The
+    rigid-body quaternion does not survive a Motive restart, so the direction
+    on the airframe that points along +X is read from the pose in front of you.
+    """
+    print()
+    print("Face the nose at the wall you slid toward in calibrate_axes.py.")
+    print("Hold the drone level and still. That heading is forward, and the drone flies that way.")
+    while True:
+        input("Press Enter to capture the heading. ")
+        samples = _collect_rotations(poses)
+        if samples is None:
+            raise SystemExit(
+                "Motive sent no rigid-body orientation.\n"
+                "Check that this rigid body is tracked and streaming."
+            )
+        mean = ext.average_quaternion(samples)
+        body_axis = ext.wall_body_axis(mean, matrix[0])
+        if mean is None or body_axis is None:
+            raise SystemExit("Could not read a heading from the rigid body.")
+        yaws = [ext.heading_of_body_axis(rot, body_axis, 0.0, matrix) for rot in samples]
+        _mean_yaw, tightness = ext.circular_mean_deg(yaws)
+        if tightness < WALL_STILL_RESULTANT:
+            print("The drone was moving. Hold it still and press Enter again.")
+            continue
+        # The captured pose is yaw 0, so the nose stays on the wall.
+        offset = ext.wrap_deg(-ext.heading_of_body_axis(mean, body_axis, 0.0, matrix))
+        poses.set_wall_heading(body_axis, offset)
+        break
+
+    deadline = time.monotonic() + 2.0
+    yaw = None
+    while time.monotonic() < deadline:
+        _motive, _cf, _age, _trail, yaw = poses.snapshot()
+        if yaw is not None:
+            break
+        time.sleep(0.05)
+    if yaw is None:
+        raise SystemExit("Heading stopped after the capture. Check the rigid body.")
+    print(f"This pose is the wall. Heading {yaw:+.0f} deg.")
+    print("The drone holds this direction. Face the same wall after every Motive or drone restart.")
+
+
+def _collect_rotations(poses):
+    started = time.monotonic()
+    seen = set()
+    samples = []
+    while time.monotonic() < started + WALL_HOLD_S:
+        rot, stamp = poses.rotation_snapshot()
+        if rot is not None and stamp not in seen:
+            seen.add(stamp)
+            samples.append(rot)
+        time.sleep(0.02)
+    if len(samples) < WALL_MIN_SAMPLES:
+        return None
+    return samples
+
+
+def main():
+    args = ext.parse_args()
+    server_ip = args.server or input("Motive server IP: ").strip()
+    if not server_ip:
+        raise SystemExit("A Motive server IP is required.")
+    client_ip = args.client or ext.default_client_ip()
+
+    matrix, _file_yaw, loaded = ext.load_axis_calibration(args.body_id)
+    if not loaded:
+        raise SystemExit(
+            f"No axis calibration for rigid body {args.body_id}.\n"
+            "Aim the nose at the wall the drone should fly toward, then run:\n"
+            "  python3 calibrate_axes.py "
+            f"{server_ip} --client {client_ip} --body-id {args.body_id}"
+        )
+    ext.set_axis_matrix(matrix)
+    print(f"Using {ext.resolve_calibration_path(args.body_id).name} for position.")
+    print(ext.format_axis_map(matrix))
+    if args.yaw_offset is not None or args.lock_nose or args.front_marker is not None:
+        print("Marker heading and --yaw-offset are not used. Face the calibration wall when asked.")
+
+    poses = ext.PoseBuffer(args.body_id, 0.0, matrix)
+    estimates = ext.EstimateBuffer()
+    print(f"Listening for rigid body {args.body_id} on {MULTICAST_GROUP}:{DATA_PORT}.")
+    print(f"  Client {client_ip}    Server {server_ip}")
+    motive = MotiveListener(client_ip, poses.on_rigid_body)
+    motive.start()
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and poses.snapshot()[1] is None:
+        time.sleep(0.05)
+    if poses.snapshot()[1] is None:
+        motive.shutdown()
+        if motive.datagram_count == 0:
+            raise SystemExit(
+                "No UDP packets arrived on port 1511.\n"
+                "In Motive set Transmission Type to Multicast. "
+                "Unicast does not reach this script.\n"
+                "Enable on, Local Interface "
+                f"{server_ip}, data port 1511, multicast address {MULTICAST_GROUP}."
+            )
+        if motive.packet_count == 0:
+            raise SystemExit(
+                f"Received {motive.datagram_count} UDP packets from {motive.last_addr}, "
+                "but none contained a rigid body.\n"
+                f"First packet id {motive.first_id}, {motive.first_len} bytes: {motive.first_hex}"
+            )
+        ids = ", ".join(str(body_id) for body_id in motive.seen_ids)
+        raise SystemExit(
+            f"Motive is streaming rigid bodies {ids}, not {args.body_id}. "
+            "Re-run with --body-id and one of those IDs."
+        )
+
+    lock_wall_heading(poses, matrix)
+
+    cflib.crtp.init_drivers()
+    print(f"Connecting to {args.uri} ...")
+    stop = threading.Event()
+    land = threading.Event()
+    landed = threading.Event()
+    yaw_locked = threading.Event()
+    status = ext.FlightStatus()
+    sender = None
+    flight = None
+    try:
+        with SyncCrazyflie(args.uri, cf=Crazyflie(rw_cache="./cache")) as scf:
+            try:
+                cf = scf.cf
+                ext.ensure_kalman(cf)
+                try:
+                    cf.param.set_value("locSrv.extQuatStdDev", "0.05")
+                except Exception as exc:
+                    print(f"Could not set locSrv.extQuatStdDev ({exc}).")
+                ext.wait_for_body(poses, args.body_id)
+                sender = threading.Thread(
+                    target=ext.send_loop,
+                    args=(cf, poses, estimates, stop, yaw_locked),
+                    daemon=True,
+                )
+                sender.start()
+                time.sleep(0.3)
+                _motive, _cf_pos, _age, _trail, yaw = poses.snapshot()
+                ext.reset_kalman(cf, None if yaw is None else math.radians(yaw))
+                ext.start_state_log(cf, estimates)
+                if args.hover or args.figure8:
+                    if args.figure8:
+                        print(
+                            f"Figure-8 mode: climb {ext.HOVER_CLIMB_M:.1f} m, then a "
+                            f"{2 * ext.FIGURE8_X_M:.1f} x {2 * ext.FIGURE8_Y_M:.1f} m eight. "
+                            "Close the window to land."
+                        )
+                    else:
+                        print(
+                            f"Hover mode: climb {ext.HOVER_CLIMB_M:.1f} m and hold. "
+                            "Close the window to land."
+                        )
+                    flight = threading.Thread(
+                        target=ext.hover_loop,
+                        args=(
+                            cf,
+                            poses,
+                            estimates,
+                            land,
+                            landed,
+                            status,
+                            yaw_locked,
+                            args.figure8,
+                        ),
+                        daemon=True,
+                    )
+                    flight.start()
+                else:
+                    landed.set()
+                    status.set("streaming, on the ground")
+                    print("Streaming position. Re-run with --hover or --figure8 to take off.")
+                ext.run_plot(args.body_id, poses, estimates, land, status)
+                land.set()
+                if flight is not None and not landed.wait(timeout=20):
+                    print("Landing did not finish. Disconnecting.")
+            finally:
+                land.set()
+                if flight is not None:
+                    landed.wait(timeout=5)
+                stop.set()
+                if sender is not None:
+                    sender.join(timeout=1.0)
+    finally:
+        motive.shutdown()
+
+
+if __name__ == "__main__":
+    main()
