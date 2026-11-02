@@ -1,0 +1,1145 @@
+#!/usr/bin/env python3
+"""Follow a person seen by the Crazyflie AI-deck.
+
+The AI-deck stream and the YOLOv11 person boxes are already wired up.
+Write track_person() so the person box stays at the center of the image.
+The rest of this file acquires frames, draws the boxes, and, with --fly,
+sends the pose you return to the Crazyflie.
+
+Join the AI-deck Wi-Fi first. The deck serves images at 192.168.4.1 port 5000.
+Motive is a second network. Use the adapter on that network as --client.
+
+Camera only. The drone stays off:
+
+    python mocap_extpos_follow.py
+
+OptiTrack pose in the window, drone still on the ground:
+
+    python mocap_extpos_follow.py 192.168.0.164 --client 192.168.0.10 --body-id 2 --address 0xE7E7E7E7E7
+
+Arm, climb, and send your setpoint. The AI-deck stream opens first. The drone
+stays on the ground for 5 seconds and arms only if that stream stays continuous.
+q lands:
+
+    python mocap_extpos_follow.py 192.168.0.164 --client 192.168.0.10 --body-id 2 --address 0xE7E7E7E7E7 --fly
+
+Quit plot_rigid_body.py and mocap_extpos_lab.py first. They hold UDP port 1511,
+and the radio allows one link. Close cfclient too.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import socket
+import struct
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import cflib.crtp
+from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+
+import mocap_extpos as ext
+import mocap_extpos_lab as lab
+
+try:
+    import cv2
+    import numpy as np
+except ImportError as exc:
+    raise SystemExit(
+        "This script needs opencv and numpy.\n"
+        "Activate the virtual environment and run: python -m pip install -r requirements.txt"
+    ) from exc
+
+
+# AI-deck wifi-img-streamer. Magic byte, then width, height, format, and payload.
+AIDECK_MAGIC = 0xBC
+DECK_IP = "192.168.4.1"
+DECK_PORT = 5000
+PERSON_CLASS_ID = 0
+WINDOW = "AI-deck follow"
+# A dropped frame must not be integrated as a long sample time.
+MAX_DT_S = 0.2
+# Safety shell around the student setpoint. Not the tracking controller.
+MAX_SPEED_M_S = 0.30
+MAX_YAW_RATE_DEG_S = 30.0
+# Open the livestream before the motors start. Stay disarmed for this long,
+# and arm only when frames keep arriving through the whole wait.
+STREAM_HOLD_S = 5.0
+STREAM_MAX_GAP_S = 1.0
+STREAM_MIN_FRAMES = 5
+STREAM_CONNECT_S = 15.0
+
+
+@dataclass
+class Pose:
+    """Crazyflie world pose. x, y, z are meters. yaw_deg is degrees.
+
+    +X is the direction the nose faced during axis calibration.
+    +Y is left. +Z is up. Positive yaw turns left, counterclockwise from above.
+    """
+
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 0.0
+    yaw_deg: float = 0.0
+
+
+@dataclass(frozen=True)
+class Box:
+    """One person detection, in raw image pixels. The origin is the top left."""
+
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    confidence: float
+
+    @property
+    def center(self) -> tuple[float, float]:
+        """(u, v). u grows to the right. v grows downward."""
+        return (self.x1 + self.x2) * 0.5, (self.y1 + self.y2) * 0.5
+
+    @property
+    def width(self) -> int:
+        return max(0, self.x2 - self.x1)
+
+    @property
+    def height(self) -> int:
+        return max(0, self.y2 - self.y1)
+
+
+def track_person(
+    box: Box | None,
+    image_width: int,
+    image_height: int,
+    measured: Pose,
+    setpoint: Pose,
+    dt: float,
+) -> Pose:
+    """Keep the person box centered in the image.
+
+    This is the lab. Change this function. Leave the AI-deck reader, the
+    YOLOv11 detector, and the radio setup alone.
+
+    box is the chosen person, or None when nobody is visible.
+    image_width and image_height are the raw frame size in pixels.
+    The image center is (image_width / 2, image_height / 2).
+    measured is the drone's OptiTrack pose right now.
+    setpoint is the pose this function returned on the previous frame.
+    On the first frame, setpoint is the hover pose and dt is 0.
+    dt is the time since the previous frame, in seconds, and it is at most 0.2.
+
+    Return the next absolute position setpoint. The flight code sends it with
+    send_position_setpoint(x, y, z, yaw_deg). Returning setpoint unchanged
+    holds the drone where it is. While --fly is set, the script then limits
+    that command to 0.3 m/s and 30 deg/s and keeps it inside the takeoff fence.
+
+    The starter holds still.
+    """
+    if box is None or dt <= 0:
+        return setpoint
+
+    # 1. Horizontal centering error: turn heading towards person
+    img_center_x = image_width / 2.0
+    box_center_x, _ = box.center
+    err_x = (box_center_x - img_center_x) / img_center_x  # Range [-1, 1]
+    k_yaw = 80.0  # deg/s gain
+    new_yaw = setpoint.yaw_deg - (err_x * k_yaw * dt)
+
+    # 2. Distance tracking: maintain target bounding box coverage in the entire image
+    box_area = box.width * box.height
+    image_area = image_width * image_height
+    box_coverage = box_area / image_area if image_area > 0 else 0.0
+
+    target_coverage = 0.30  # Desired coverage (e.g., 0.10 = 10% of total image area)
+    err_dist = target_coverage - box_coverage
+    k_dist = 40.0  # m/s forward/back gain
+    v_forward = err_dist * k_dist
+
+    # Convert forward movement into OptiTrack world coordinate frame
+    yaw_rad = math.radians(measured.yaw_deg)
+    dx = v_forward * math.cos(yaw_rad) * dt
+    dy = v_forward * math.sin(yaw_rad) * dt
+
+    return Pose(
+        x=setpoint.x + dx,
+        y=setpoint.y + dy,
+        z=setpoint.z,
+        yaw_deg=new_yaw,
+    )
+
+
+class AideckClient:
+    """Blocking reader for the Bitcraze AI-deck image stream."""
+
+    def __init__(self, ip: str, port: int, timeout_sec: float) -> None:
+        self._ip = ip
+        self._port = port
+        self._timeout_sec = timeout_sec
+        self._socket: socket.socket | None = None
+
+    @property
+    def connected(self) -> bool:
+        return self._socket is not None
+
+    def connect(self) -> None:
+        self.close()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.settimeout(self._timeout_sec)
+        sock.connect((self._ip, self._port))
+        self._socket = sock
+
+    def close(self) -> None:
+        if self._socket is None:
+            return
+        try:
+            self._socket.close()
+        except OSError:
+            pass
+        self._socket = None
+
+    def read_frame(self) -> tuple[int, int, int, bytes]:
+        """Return width, height, format (0 = Bayer, otherwise JPEG), and payload."""
+        packet_info = self._rx_bytes(4)
+        length, _routing, _function = struct.unpack("<HBB", packet_info)
+        header = self._rx_bytes(length - 2)
+        if len(header) < 11:
+            raise ValueError(f"AI-deck image header is {len(header)} bytes, expected at least 11")
+        magic, width, height, _depth, fmt, size = struct.unpack_from("<BHHBBI", header)
+        if magic != AIDECK_MAGIC:
+            raise ValueError(f"Unexpected AI-deck magic byte: 0x{magic:02X}")
+        if size < 0:
+            raise ValueError(f"Unexpected image size: {size}")
+        payload = bytearray()
+        while len(payload) < size:
+            chunk_info = self._rx_bytes(4)
+            chunk_len, _dst, _src = struct.unpack("<HBB", chunk_info)
+            payload.extend(self._rx_bytes(chunk_len - 2))
+        return width, height, fmt, bytes(payload[:size])
+
+    def _rx_bytes(self, size: int) -> bytearray:
+        if self._socket is None:
+            raise RuntimeError("Not connected to the AI-deck")
+        data = bytearray()
+        while len(data) < size:
+            chunk = self._socket.recv(size - len(data))
+            if not chunk:
+                raise ConnectionError("AI-deck socket closed while reading")
+            data.extend(chunk)
+        return data
+
+
+def decode_frame(width: int, height: int, fmt: int, payload: bytes) -> np.ndarray:
+    """Return a BGR image. Bayer frames are shown as gray expanded to BGR."""
+    if fmt == 0:
+        expected = width * height
+        if len(payload) < expected:
+            raise ValueError(f"Bayer frame is {len(payload)} bytes, expected {expected}")
+        gray = np.frombuffer(payload[:expected], dtype=np.uint8).reshape(height, width)
+        return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    bgr = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise ValueError("Failed to decode JPEG from the AI-deck")
+    return bgr
+
+
+@dataclass(frozen=True)
+class DecodedFrame:
+    seq: int
+    image: np.ndarray
+    mono: float
+
+
+class AideckReceiver:
+    """Keep the AI-deck TCP stream reading while the main thread arms and climbs.
+
+    The deck stalls if nothing drains the socket. Takeoff blocks the main thread,
+    so the frames have to arrive on their own thread, started before arming.
+    """
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self._client = AideckClient(args.deck_ip, args.deck_port, args.timeout)
+        self._reconnect_s = args.reconnect
+        self._ip = args.deck_ip
+        self._port = args.deck_port
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._latest: DecodedFrame | None = None
+        self._seq = 0
+        self._last_mono: float | None = None
+        self._watching = False
+        self._watch_ok = True
+        self._watch_count = 0
+        self._announced = False
+        self._thread = threading.Thread(target=self._loop, name="aideck", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._client.close()
+        if self._thread.ident is None:
+            return
+        self._thread.join(timeout=2.0)
+        if self._thread.is_alive():
+            self._client.close()
+            self._thread.join(timeout=1.0)
+
+    def latest(self) -> DecodedFrame | None:
+        with self._lock:
+            return self._latest
+
+    def wait_for_first_frame(self, timeout: float, land: threading.Event) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if land.is_set() or self._stop.is_set():
+                return False
+            if self.latest() is not None:
+                return True
+            land.wait(0.05)
+        return self.latest() is not None
+
+    def begin_watch(self) -> None:
+        """Start a fresh continuity window. Connection time does not count."""
+        with self._lock:
+            self._watching = True
+            self._watch_ok = True
+            self._watch_count = 0
+            self._last_mono = time.monotonic()
+
+    def stream_status(self) -> tuple[bool, int, float]:
+        """Return whether frames are still arriving, how many, and the age of the last one."""
+        with self._lock:
+            if self._last_mono is None:
+                return False, self._watch_count, STREAM_MAX_GAP_S + 1.0
+            age = time.monotonic() - self._last_mono
+            continuous = self._watch_ok and age <= STREAM_MAX_GAP_S
+            return continuous, self._watch_count, age
+
+    def end_watch(self, stop: bool = True) -> tuple[int, bool]:
+        """Return frame count and whether the stream stayed continuous.
+
+        stop=False leaves the watch running so a later stall still counts.
+        """
+        with self._lock:
+            count = self._watch_count
+            if self._last_mono is None:
+                age = STREAM_MAX_GAP_S + 1.0
+            else:
+                age = time.monotonic() - self._last_mono
+            ok = (
+                self._watch_ok
+                and self._last_mono is not None
+                and age <= STREAM_MAX_GAP_S
+                and count >= STREAM_MIN_FRAMES
+            )
+            if stop:
+                self._watching = False
+            return count, ok
+
+    def _publish(self, image: np.ndarray) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if self._watching and self._last_mono is not None and now - self._last_mono > STREAM_MAX_GAP_S:
+                self._watch_ok = False
+            self._last_mono = now
+            if self._watching:
+                self._watch_count += 1
+            self._seq += 1
+            self._latest = DecodedFrame(self._seq, image, now)
+
+    def _note_break(self) -> None:
+        with self._lock:
+            if self._watching:
+                self._watch_ok = False
+            self._last_mono = None
+
+    def _loop(self) -> None:
+        try:
+            while not self._stop.is_set():
+                try:
+                    if not self._client.connected:
+                        print(f"Connecting to the AI-deck at {self._ip}:{self._port}...", flush=True)
+                        self._client.connect()
+                        if self._stop.is_set():
+                            break
+                        print("AI-deck connected.", flush=True)
+                    width, height, fmt, payload = self._client.read_frame()
+                    image = decode_frame(width, height, fmt, payload)
+                except (ConnectionError, OSError, TimeoutError, ValueError) as exc:
+                    if self._stop.is_set():
+                        break
+                    print(f"Stream error: {exc}", flush=True)
+                    self._client.close()
+                    self._note_break()
+                    if self._stop.wait(self._reconnect_s):
+                        break
+                    continue
+                if not self._announced:
+                    print(f"Receiving AI-deck images ({width}x{height}).", flush=True)
+                    self._announced = True
+                self._publish(image)
+        finally:
+            self._client.close()
+
+
+class PersonDetector:
+    """YOLOv11 person detector. Boxes are in the same pixels as the frame."""
+
+    def __init__(self, model_path: Path, conf: float, device: str) -> None:
+        from ultralytics import YOLO
+
+        self._model = YOLO(str(model_path))
+        self._conf = conf
+        self._device = device
+        self.last_infer_ms: float = 0.0
+        print(f"Loaded {model_path.name} on {device}.", flush=True)
+
+    def detect(self, bgr: np.ndarray) -> list[Box]:
+        t0 = time.perf_counter()
+        result = self._model.predict(
+            bgr,
+            conf=self._conf,
+            classes=[PERSON_CLASS_ID],
+            device=self._device,
+            verbose=False,
+        )[0]
+        self.last_infer_ms = (time.perf_counter() - t0) * 1000.0
+        speed = getattr(result, "speed", {})
+        inf_core = speed.get("inference", self.last_infer_ms)
+        print(
+            f"[YOLO] Total: {self.last_infer_ms:.1f} ms (core model: {inf_core:.1f} ms)",
+            flush=True,
+        )
+        boxes: list[Box] = []
+        if result.boxes is None or len(result.boxes) == 0:
+            return boxes
+        xyxy = result.boxes.xyxy.cpu().numpy()
+        confs = result.boxes.conf.cpu().numpy()
+        classes = result.boxes.cls.cpu().numpy().astype(int)
+        for (x1, y1, x2, y2), conf, cls_id in zip(xyxy, confs, classes):
+            if cls_id != PERSON_CLASS_ID:
+                continue
+            boxes.append(Box(int(x1), int(y1), int(x2), int(y2), float(conf)))
+        return boxes
+
+
+def find_model(explicit: str | None) -> Path:
+    if explicit:
+        path = Path(explicit).expanduser()
+        if not path.is_file():
+            raise SystemExit(f"YOLO weights not found: {path}")
+        return path
+    local = Path(__file__).resolve().parent / "yolo11n.pt"
+    if local.is_file():
+        return local
+    return Path("yolo11n.pt")
+
+
+def default_device() -> str:
+    try:
+        import torch
+    except ImportError:
+        return "cpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(getattr(torch, "backends", None), "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def select_person(boxes: list[Box]) -> Box | None:
+    """The person the controller should track. Highest confidence, then tallest box."""
+    if not boxes:
+        return None
+    return max(boxes, key=lambda box: (box.confidence, box.height))
+
+
+class SetpointSender:
+    """Repeat the latest setpoint. The Crazyflie drops the link if these stop."""
+
+    def __init__(self, cf) -> None:
+        self._cf = cf
+        self._lock = threading.Lock()
+        self.pose = Pose()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="setpoint", daemon=True)
+
+    def start(self, pose: Pose) -> None:
+        self.update(pose)
+        self._thread.start()
+
+    def update(self, pose: Pose) -> None:
+        with self._lock:
+            self.pose = pose
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def _loop(self) -> None:
+        period = 1.0 / ext.SETPOINT_HZ
+        while not self._stop.is_set():
+            with self._lock:
+                pose = self.pose
+            self._cf.commander.send_position_setpoint(pose.x, pose.y, pose.z, pose.yaw_deg)
+            self._stop.wait(period)
+
+
+def read_pose(poses) -> Pose | None:
+    if poses is None:
+        return None
+    _motive, cf_pos, age, _trail, yaw = poses.snapshot()
+    if cf_pos is None or yaw is None or age is None or age > ext.STALE_S:
+        return None
+    return Pose(cf_pos[0], cf_pos[1], cf_pos[2], yaw)
+
+
+def clamp_to_fence(command: Pose, home: Pose, args: argparse.Namespace) -> Pose:
+    """Keep a flying setpoint near the takeoff point."""
+    dx = command.x - home.x
+    dy = command.y - home.y
+    dist = math.hypot(dx, dy)
+    if dist > args.max_radius > 0.0:
+        scale = args.max_radius / dist
+        dx *= scale
+        dy *= scale
+    z = min(max(command.z, home.z + args.min_up), home.z + args.max_up)
+    return Pose(home.x + dx, home.y + dy, z, ext.wrap_deg(command.yaw_deg))
+
+
+def approach(previous: Pose, command: Pose, dt: float) -> Pose:
+    """Move previous toward command, no faster than the safety speed."""
+    step = max(dt, 1.0 / ext.SETPOINT_HZ)
+    dist = math.hypot(command.x - previous.x, command.y - previous.y)
+    max_step = MAX_SPEED_M_S * step
+    if dist > max_step > 0.0:
+        scale = max_step / dist
+        x = previous.x + (command.x - previous.x) * scale
+        y = previous.y + (command.y - previous.y) * scale
+    else:
+        x = command.x
+        y = command.y
+    z_step = MAX_SPEED_M_S * step
+    z = previous.z + max(-z_step, min(z_step, command.z - previous.z))
+    yaw_step = MAX_YAW_RATE_DEG_S * step
+    yaw_error = ext.wrap_deg(command.yaw_deg - previous.yaw_deg)
+    yaw = ext.wrap_deg(previous.yaw_deg + max(-yaw_step, min(yaw_step, yaw_error)))
+    return Pose(x, y, z, yaw)
+
+
+def draw_frame(
+    image: np.ndarray,
+    boxes: list[Box],
+    selected: Box | None,
+    setpoint: Pose,
+    flying: bool,
+    scale: int,
+    hz: float,
+) -> np.ndarray:
+    view = cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_NEAREST)
+    height, width = view.shape[:2]
+    center = (width // 2, height // 2)
+    cv2.drawMarker(view, center, (255, 255, 255), cv2.MARKER_CROSS, 24, 1)
+    for box in boxes:
+        chosen = box is selected
+        color = (0, 220, 255) if chosen else (0, 220, 0)
+        x1, y1, x2, y2 = (int(value * scale) for value in (box.x1, box.y1, box.x2, box.y2))
+        cv2.rectangle(view, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            view,
+            f"person {box.confidence:.2f}",
+            (x1, max(16, y1 - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+        if chosen:
+            u, v = box.center
+            cv2.line(view, center, (int(u * scale), int(v * scale)), color, 1)
+    lines = [f"{'FLYING' if flying else 'preview, not flying'}   {hz:.1f} Hz   people={len(boxes)}"]
+    if selected is None:
+        lines.append("no person")
+    else:
+        u, v = selected.center
+        cov_pct = ((selected.width * selected.height) / (image.shape[1] * image.shape[0])) * 100.0
+        lines.append(
+            f"person u={u:.0f} v={v:.0f}  cov={cov_pct:.1f}%   "
+            f"center u={image.shape[1] / 2:.0f} v={image.shape[0] / 2:.0f}"
+        )
+    lines.append(
+        f"setpoint  x={setpoint.x:+.2f}  y={setpoint.y:+.2f}  "
+        f"z={setpoint.z:+.2f}  yaw={setpoint.yaw_deg:+.0f}"
+    )
+    line_h = 22
+    bar = np.zeros((8 + line_h * len(lines), view.shape[1], 3), dtype=np.uint8)
+    for index, text in enumerate(lines):
+        cv2.putText(
+            bar,
+            text,
+            (8, 18 + index * line_h),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    return np.vstack((view, bar))
+
+
+@dataclass
+class PreviewState:
+    seq: int = -1
+    shown: bool = False
+    start: float = 0.0
+    count: int = 0
+    hz: float = 0.0
+
+
+def ensure_window() -> None:
+    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+
+
+def show_message(text: str) -> None:
+    """Put a status line on screen before the first image arrives."""
+    canvas = np.full((180, 720, 3), 20, dtype=np.uint8)
+    cv2.putText(
+        canvas,
+        text,
+        (16, 100),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.imshow(WINDOW, canvas)
+    cv2.waitKey(1)
+
+
+def paint_latest(args, detector, receiver: AideckReceiver, pose: Pose, flying: bool, view: PreviewState) -> None:
+    """Draw the newest frame, including person boxes, when one has arrived."""
+    frame = receiver.latest()
+    if frame is None or frame.seq == view.seq:
+        return
+    view.seq = frame.seq
+    now = time.perf_counter()
+    view.count += 1
+    elapsed = now - view.start
+    if elapsed >= 1.0:
+        view.hz = view.count / elapsed
+        view.start = now
+        view.count = 0
+    image = frame.image
+    if not view.shown:
+        # Show the picture before YOLO. The first inference can take several seconds.
+        quick = cv2.resize(
+            image, None, fx=args.preview_scale, fy=args.preview_scale, interpolation=cv2.INTER_NEAREST
+        )
+        cv2.imshow(WINDOW, quick)
+        cv2.waitKey(1)
+        view.shown = True
+    boxes = detector.detect(image)
+    selected = select_person(boxes)
+    canvas = draw_frame(image, boxes, selected, pose, flying, args.preview_scale, view.hz)
+    cv2.imshow(WINDOW, canvas)
+    view.shown = True
+
+
+def wait_for_preview(args, detector, receiver: AideckReceiver, pose: Pose, land: threading.Event, timeout: float) -> bool:
+    """Keep the preview window open until the first AI-deck frame is on screen."""
+    ensure_window()
+    view = PreviewState(start=time.perf_counter())
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if land.is_set():
+            return False
+        if receiver.latest() is None:
+            show_message("Waiting for the AI-deck image stream...")
+        else:
+            paint_latest(args, detector, receiver, pose, False, view)
+            return True
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("q"), 27):
+            land.set()
+            return False
+        time.sleep(0.02)
+    return receiver.latest() is not None
+
+
+def quit_requested(shown: bool, land: threading.Event) -> bool:
+    key = cv2.waitKey(1) & 0xFF
+    if key in (ord("q"), 27):
+        land.set()
+        return True
+    if shown and cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) == 0:
+        land.set()
+        return True
+    return False
+
+
+def keep_view_open(
+    args,
+    detector,
+    receiver: AideckReceiver,
+    pose: Pose,
+    flying: bool,
+    land: threading.Event,
+    seconds: float | None = None,
+    worker: threading.Thread | None = None,
+) -> None:
+    """Keep the livestream window moving until a timer ends or a worker exits."""
+    view = PreviewState(start=time.perf_counter())
+    deadline = None if seconds is None else time.monotonic() + seconds
+    while True:
+        if worker is not None and not worker.is_alive():
+            return
+        if deadline is not None and time.monotonic() >= deadline:
+            return
+        if land.is_set() and worker is None:
+            return
+        paint_latest(args, detector, receiver, pose, flying, view)
+        if quit_requested(view.shown, land) and worker is None:
+            return
+        time.sleep(0.005)
+
+
+def run_while_showing(args, detector, receiver, pose: Pose, flying: bool, land: threading.Event, work):
+    """Run a blocking radio step beside the livestream so the window stays live."""
+    box: dict = {}
+
+    def _run() -> None:
+        try:
+            box["value"] = work()
+        except Exception as exc:
+            box["error"] = exc
+            land.set()
+
+    worker = threading.Thread(target=_run, name="takeoff-step", daemon=True)
+    worker.start()
+    try:
+        keep_view_open(args, detector, receiver, pose, flying, land, worker=worker)
+    finally:
+        if worker.is_alive():
+            land.set()
+        worker.join(timeout=2.0)
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def run_camera(
+    args,
+    detector,
+    poses,
+    initial: Pose,
+    home: Pose | None,
+    sender: SetpointSender | None,
+    land: threading.Event,
+    receiver: AideckReceiver | None = None,
+) -> None:
+    """Read the AI-deck, draw every person box, and call track_person()."""
+    owns_receiver = receiver is None
+    if receiver is None:
+        receiver = AideckReceiver(args)
+        receiver.start()
+    setpoint = initial
+    last_measured = initial
+    last_time: float | None = None
+    last_seq = -1
+    window_start = time.perf_counter()
+    window_count = 0
+    hz = 0.0
+    shown = False
+    print(f"Live view of {args.deck_ip}:{args.deck_port}. Press q to stop.", flush=True)
+    try:
+        while not land.is_set():
+            if sender is not None and poses is not None and not ext.mocap_fresh(poses):
+                print("OptiTrack update stopped. Landing.", flush=True)
+                land.set()
+                break
+            frame = receiver.latest()
+            if frame is not None and frame.seq != last_seq:
+                last_seq = frame.seq
+                image = frame.image
+                if last_time is None:
+                    dt = 0.0
+                else:
+                    dt = min(MAX_DT_S, max(0.0, frame.mono - last_time))
+                last_time = frame.mono
+                window_count += 1
+                elapsed = time.perf_counter() - window_start
+                if elapsed >= 1.0:
+                    hz = window_count / elapsed
+                    window_start = time.perf_counter()
+                    window_count = 0
+
+                measured = read_pose(poses)
+                if measured is None:
+                    measured = last_measured
+                else:
+                    last_measured = measured
+                boxes = detector.detect(image)
+                selected = select_person(boxes)
+                command = track_person(selected, image.shape[1], image.shape[0], measured, setpoint, dt)
+                if not isinstance(command, Pose):
+                    raise TypeError("track_person() must return a Pose.")
+                if sender is not None and home is not None:
+                    command = approach(setpoint, clamp_to_fence(command, home, args), dt)
+                    sender.update(command)
+                setpoint = command
+
+                canvas = draw_frame(
+                    image, boxes, selected, setpoint, sender is not None, args.preview_scale, hz
+                )
+                cv2.imshow(WINDOW, canvas)
+                shown = True
+            key = cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
+                land.set()
+                break
+            if shown and cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) == 0:
+                land.set()
+                break
+            time.sleep(0.005)
+    finally:
+        if owns_receiver:
+            receiver.stop()
+        cv2.destroyAllWindows()
+
+
+def open_motive(args, server_ip: str):
+    client_ip = args.client or ext.default_client_ip()
+    matrix, _file_yaw, loaded = ext.load_axis_calibration(args.body_id)
+    if not loaded:
+        raise SystemExit(
+            f"No axis calibration for rigid body {args.body_id}.\n"
+            "Run calibrate_axes.py once with this --body-id, then start again."
+        )
+    ext.set_axis_matrix(matrix)
+    print(f"Using {ext.resolve_calibration_path(args.body_id).name} for position.")
+    print(ext.format_axis_map(matrix))
+    poses = ext.PoseBuffer(args.body_id, 0.0, matrix)
+    print(f"Listening for rigid body {args.body_id} on {lab.MULTICAST_GROUP}:{lab.DATA_PORT}.")
+    print(f"  Client {client_ip}    Server {server_ip}")
+    motive = lab.MotiveListener(client_ip, poses.on_rigid_body)
+    motive.start()
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and poses.snapshot()[1] is None:
+        time.sleep(0.05)
+    if poses.snapshot()[1] is None:
+        motive.shutdown()
+        raise SystemExit(
+            "Motive is not streaming this rigid body.\n"
+            "Use multicast, data port 1511, and a --body-id that Motive is sending. "
+            "Quit any other client first."
+        )
+    lab.lock_wall_heading(poses, matrix)
+    return motive, poses
+
+
+def land_drone(cf, pose: Pose, home: Pose) -> None:
+    print("Landing.", flush=True)
+    try:
+        x, y, z, yaw = pose.x, pose.y, pose.z, pose.yaw_deg
+        if math.hypot(x - home.x, y - home.y) >= 0.02:
+            print("Returning to the takeoff point.", flush=True)
+            x, y = ext.slide_xy(cf, x, y, home.x, home.y, z, yaw)
+        ext.ramp_z(cf, x, y, z, home.z, yaw, ext.CLIMB_S, land=None, abortable=False)
+        ext.send_setpoints_uninterruptible(cf, x, y, home.z, yaw, 0.5)
+    except KeyboardInterrupt:
+        print("Landing interrupted. Disarming.", flush=True)
+    try:
+        cf.commander.send_notify_setpoint_stop()
+        time.sleep(0.1)
+        cf.supervisor.send_arming_request(False)
+    except Exception as exc:
+        print(f"Could not disarm cleanly: {exc}", flush=True)
+        print("Cut power if a motor is still spinning.", flush=True)
+    else:
+        print("Landed and disarmed.", flush=True)
+
+
+def hold_for_stream(args, detector, poses, receiver: AideckReceiver, home: Pose, land: threading.Event) -> bool:
+    """Show the livestream on the ground. Arm only after it stays continuous."""
+    print(
+        f"Holding on the ground for {STREAM_HOLD_S:.0f} seconds. "
+        "Arming happens only if images keep arriving. Press q or Ctrl-C to stay down.",
+        flush=True,
+    )
+    ensure_window()
+    receiver.begin_watch()
+    view = PreviewState(start=time.perf_counter())
+    deadline = time.monotonic() + STREAM_HOLD_S
+    next_report = time.monotonic() + 1.0
+    failed_reason: str | None = None
+    while time.monotonic() < deadline:
+        if land.is_set():
+            failed_reason = "Staying on the ground."
+            break
+        if poses is not None and not ext.mocap_fresh(poses):
+            land.set()
+            failed_reason = "OptiTrack update stopped. Staying on the ground."
+            break
+        continuous, count, age = receiver.stream_status()
+        if not continuous:
+            failed_reason = (
+                f"Image stream interrupted ({count} frames, {age:.1f} s since the last one). "
+                "Staying on the ground."
+            )
+            break
+        if time.monotonic() >= next_report:
+            remaining = deadline - time.monotonic()
+            print(
+                f"Ground hold: {remaining:.0f} s left, {count} frames, stream continuous.",
+                flush=True,
+            )
+            next_report += 1.0
+        paint_latest(args, detector, receiver, home, False, view)
+        if quit_requested(view.shown, land):
+            failed_reason = "Staying on the ground."
+            break
+        time.sleep(0.005)
+    # Leave the watch running on success so a stall before climb still cancels takeoff.
+    count, stream_ok = receiver.end_watch(stop=False)
+    if failed_reason is not None or not stream_ok:
+        receiver.end_watch(stop=True)
+        if failed_reason is not None:
+            print(failed_reason, flush=True)
+        else:
+            print(
+                f"Image stream was not continuous ({count} frames in {STREAM_HOLD_S:.0f} s). "
+                f"Need at least {STREAM_MIN_FRAMES} frames and no gap over {STREAM_MAX_GAP_S:.1f} s. "
+                "Staying on the ground.",
+                flush=True,
+            )
+        return False
+    print(f"Image stream is continuous ({count} frames in {STREAM_HOLD_S:.0f} s).", flush=True)
+    return True
+
+
+def fly(args, poses, detector, land: threading.Event) -> None:
+    """Open the camera, hold on the ground, then climb and let track_person() steer."""
+    estimates = ext.EstimateBuffer()
+    cflib.crtp.init_drivers()
+    print(f"Connecting to {args.uri}", flush=True)
+    print("Close cfclient and mocap_extpos_lab.py. This process owns the radio.", flush=True)
+    with SyncCrazyflie(args.uri, cf=Crazyflie(rw_cache="./cache")) as scf:
+        cf = scf.cf
+        ext.ensure_kalman(cf)
+        try:
+            cf.param.set_value("locSrv.extQuatStdDev", "0.05")
+        except Exception as exc:
+            print(f"Could not set locSrv.extQuatStdDev ({exc}).", flush=True)
+        ext.wait_for_body(poses, args.body_id)
+        stop = threading.Event()
+        yaw_locked = threading.Event()
+        extpos = threading.Thread(
+            target=ext.send_loop,
+            args=(cf, poses, estimates, stop, yaw_locked),
+            name="extpos",
+            daemon=True,
+        )
+        extpos.start()
+        armed = False
+        sender: SetpointSender | None = None
+        home: Pose | None = None
+        sent = Pose()
+        commanded = {"pose": sent}
+        receiver: AideckReceiver | None = None
+        try:
+            time.sleep(0.3)
+            _motive, home_pos, _age, _trail, yaw = poses.snapshot()
+            ext.reset_kalman(cf, None if yaw is None else math.radians(yaw))
+            ext.start_state_log(cf, estimates)
+            if not ext.wait_until_tracking(poses, estimates, land, yaw_locked):
+                print("Estimate did not lock onto OptiTrack. Staying on the ground.", flush=True)
+                return
+            _motive, home_pos, age, _trail, yaw = poses.snapshot()
+            if home_pos is None or yaw is None or age is None or age > ext.STALE_S:
+                print("OptiTrack pose went stale before takeoff. Staying on the ground.", flush=True)
+                return
+            home = Pose(home_pos[0], home_pos[1], home_pos[2], yaw)
+            hover = Pose(home.x, home.y, home.z + args.climb, home.yaw_deg)
+            sent = home
+            commanded["pose"] = home
+            print(
+                f"Takeoff pose x={home.x:+.2f} y={home.y:+.2f} z={home.z:+.2f} "
+                f"yaw={home.yaw_deg:+.0f}. Hover height {hover.z:+.2f}.",
+                flush=True,
+            )
+            print(
+                f"Opening the AI-deck stream at {args.deck_ip}:{args.deck_port} before arming.",
+                flush=True,
+            )
+            print(f"Live view of {args.deck_ip}:{args.deck_port}. The window stays up on the ground.", flush=True)
+            receiver = AideckReceiver(args)
+            receiver.start()
+            got_frame = wait_for_preview(args, detector, receiver, home, land, STREAM_CONNECT_S)
+            if land.is_set():
+                print("Staying on the ground.", flush=True)
+                return
+            if not got_frame:
+                print(
+                    "No image arrived from the AI-deck. "
+                    "Join the AI-deck Wi-Fi, then try again. Staying on the ground.",
+                    flush=True,
+                )
+                return
+            if not hold_for_stream(args, detector, poses, receiver, home, land):
+                return
+
+            cf.commander.send_notify_setpoint_stop()
+            if land.wait(0.3):
+                print("Staying on the ground.", flush=True)
+                return
+            continuous, _count, age = receiver.stream_status()
+            if not continuous:
+                print(
+                    f"Image stream stalled before arming ({age:.1f} s since the last frame). "
+                    "Staying on the ground.",
+                    flush=True,
+                )
+                return
+            print("Arming.", flush=True)
+            cf.supervisor.send_arming_request(True)
+            armed = True
+            print("Armed. Holding on the ground for 2 seconds with the stream open.", flush=True)
+            keep_view_open(args, detector, receiver, home, False, land, seconds=2.0)
+            _frames, still_live = receiver.end_watch()
+            if land.is_set() or not still_live:
+                if not still_live and not land.is_set():
+                    print("Image stream stalled after arming. Landing.", flush=True)
+                    land.set()
+                return
+            held = run_while_showing(
+                args,
+                detector,
+                receiver,
+                home,
+                True,
+                land,
+                lambda: ext.send_setpoints(cf, home.x, home.y, home.z, home.yaw_deg, 1.0, land),
+            )
+            if not held:
+                return
+            print(f"Climbing to {hover.z:+.2f} m.", flush=True)
+
+            def climb() -> float:
+                z_now = ext.ramp_z(
+                    cf, home.x, home.y, home.z, hover.z, home.yaw_deg, ext.CLIMB_S, land, True
+                )
+                commanded["pose"] = Pose(home.x, home.y, z_now, home.yaw_deg)
+                return z_now
+
+            run_while_showing(args, detector, receiver, home, True, land, climb)
+            sent = commanded["pose"]
+            if land.is_set():
+                return
+            sender = SetpointSender(cf)
+            sender.start(sent)
+            print(
+                "In the air. track_person() chooses the setpoint. "
+                f"Motion is limited to {MAX_SPEED_M_S:.1f} m/s and {MAX_YAW_RATE_DEG_S:.0f} deg/s. "
+                "Press q to land.",
+                flush=True,
+            )
+            run_camera(args, detector, poses, sent, home, sender, land, receiver)
+        except KeyboardInterrupt:
+            land.set()
+            print("\nStopping.", flush=True)
+        finally:
+            sent = commanded["pose"]
+            if sender is not None:
+                sent = sender.pose
+                sender.stop()
+            if armed and home is not None:
+                land_drone(cf, sent, home)
+            stop.set()
+            extpos.join(timeout=1.0)
+            if receiver is not None:
+                receiver.stop()
+            cv2.destroyAllWindows()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Stream the AI-deck, draw YOLOv11 person boxes, and follow with track_person()."
+    )
+    parser.add_argument("server", nargs="?", help="Motive PC IP. Omit for a camera-only preview.")
+    parser.add_argument("--client", default=None, help="This PC's IP on the Motive network")
+    parser.add_argument("--body-id", type=int, default=ext.BODY_ID)
+    parser.add_argument("--uri", default=ext.URI, help="Crazyflie radio URI. --address replaces the drone address in it.")
+    parser.add_argument("--address", help="Crazyflie radio address, for example 0xE7E7E7E7E7")
+    parser.add_argument(
+        "--fly",
+        action="store_true",
+        help="Open the AI-deck stream, arm only if it stays continuous, then climb and follow",
+    )
+    parser.add_argument("--climb", type=float, default=1.0, help="Meters above takeoff")
+    parser.add_argument("--min-up", type=float, default=0.25, help="Lowest flying height above takeoff, meters")
+    parser.add_argument("--max-up", type=float, default=1.5, help="Highest flying height above takeoff, meters")
+    parser.add_argument("--max-radius", type=float, default=1.0, help="Horizontal fence around takeoff, meters")
+    parser.add_argument("--deck-ip", default=DECK_IP, help=f"AI-deck IP (default {DECK_IP})")
+    parser.add_argument("--deck-port", type=int, default=DECK_PORT, help=f"AI-deck port (default {DECK_PORT})")
+    parser.add_argument("--timeout", type=float, default=5.0, help="AI-deck socket timeout, seconds")
+    parser.add_argument("--reconnect", type=float, default=2.0, help="Delay before reconnecting the AI-deck")
+    parser.add_argument("--model", help="YOLOv11 weights. Default: yolo11n.pt in this folder")
+    parser.add_argument("--device", default=default_device(), help="YOLO device: cpu, cuda, or mps")
+    parser.add_argument("--conf", type=float, default=0.25, help="Minimum person detection confidence")
+    parser.add_argument("--preview-scale", type=int, default=3, help="Display scale. AI-deck frames are small")
+    args = parser.parse_args()
+    if args.climb <= 0.0 or args.min_up <= 0.0 or args.max_up <= 0.0 or args.max_radius <= 0.0:
+        raise SystemExit("--climb, --min-up, --max-up, and --max-radius must be positive.")
+    if not (args.min_up <= args.climb <= args.max_up):
+        raise SystemExit("--climb must sit between --min-up and --max-up.")
+    if args.preview_scale < 1:
+        raise SystemExit("--preview-scale must be at least 1.")
+    if args.address:
+        args.uri = ext.uri_with_address(args.uri, args.address)
+    return args
+
+
+def main() -> None:
+    args = parse_args()
+    print("Loading YOLOv11. The first start can take a moment.", flush=True)
+    detector = PersonDetector(find_model(args.model), args.conf, args.device)
+    print("Edit track_person() in this file to center the person box.", flush=True)
+    land = threading.Event()
+    motive = None
+    try:
+        poses = None
+        if args.server or args.fly:
+            server = args.server or input("Motive server IP: ").strip()
+            if not server:
+                raise SystemExit("A Motive server IP is required.")
+            motive, poses = open_motive(args, server)
+        if args.fly:
+            fly(args, poses, detector, land)
+            return
+        print("Camera preview. The drone stays on the ground. Pass --fly to arm. Press q to close.", flush=True)
+        initial = read_pose(poses) or Pose()
+        run_camera(args, detector, poses, initial, None, None, land)
+    except KeyboardInterrupt:
+        land.set()
+        print("\nStopped.", flush=True)
+    finally:
+        if motive is not None:
+            motive.shutdown()
+
+
+if __name__ == "__main__":
+    main()
