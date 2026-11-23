@@ -1,0 +1,6 @@
+gymnasium[mujoco,classic-control]>=1.0
+torch>=2.0
+numpy>=1.20
+matplotlib>=3.5
+imageio>=2.30
+imageio-ffmpeg>=0.4
